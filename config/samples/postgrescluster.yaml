@@ -1,0 +1,30 @@
+apiVersion: postgres.example.com/v1alpha1
+kind: PostgresCluster
+metadata:
+  name: example
+  namespace: databases
+spec:
+  region: local
+  instances: 1
+  postgres:
+    majorVersion: 17
+    image: postgres:17-bookworm
+    parameters:
+      max_connections: "50"
+      shared_buffers: 128MB
+  bootstrap:
+    initdb:
+      superuserSecretRef:
+        name: example-bootstrap
+      checksums: true
+  storage:
+    data:
+      size: 1Gi
+      accessMode: ReadWriteOnce
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  deletionPolicy: Retain

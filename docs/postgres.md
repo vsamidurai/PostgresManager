@@ -1,10 +1,12 @@
-# PostgreSQL Runtime Decision
+# Postgres Design
 
 Status: Open decision with required behavior defined
 
-The operator owns regional and global Kubernetes reconciliation. It still needs a process inside each database pod to supervise PostgreSQL, apply configuration, expose health, and execute a safe local HA protocol. That process is a runtime component, not a second Kubernetes operator.
+The initial single-instance implementation uses the official PostgreSQL image entrypoint with a bootstrap identity/version guard. It does not implement the HA contract below or settle the instance-manager decision. See [current implementation scope](../README.md#implemented-scope).
 
-The first release will certify one runtime. The contract below prevents controller code from depending on incidental command details; it does not imply support for arbitrary interchangeable HA plugins.
+The operator owns regional and global Kubernetes reconciliation. The **Postgres component** contains PostgreSQL and its **instance manager** inside each database pod. The instance manager supervises PostgreSQL, applies configuration, exposes health, and executes a safe local HA protocol.
+
+The first release will certify one implementation of the Postgres instance manager. The contract below prevents controller code from depending on incidental command details; it does not imply support for arbitrary interchangeable HA plugins.
 
 ## Candidate implementations
 
@@ -17,7 +19,9 @@ pg_auto_failover and repmgr remain reference alternatives but are not additional
 
 Patroni's synchronous mode records membership in its distributed configuration store and constrains promotion within that protocol. Independent standby clusters do not automatically become part of the same election or durability history. We must demonstrate how remote acknowledgements and regional promotions compose, rather than manually overwriting settings that Patroni also manages. See [Patroni synchronous mode](https://patroni.readthedocs.io/en/latest/replication_modes.html) and [standby clusters](https://patroni.readthedocs.io/en/latest/standby_cluster.html).
 
-## Runtime contract
+## Postgres management contract
+
+The Postgres instance manager implements the following capabilities:
 
 | Capability | Required behavior |
 | --- | --- |
@@ -32,19 +36,19 @@ Patroni's synchronous mode records membership in its distributed configuration s
 | Upgrade | Run a certified upgrade task with old/new binaries, durable step markers, output artifacts, and safe retry rules. |
 | Secure management | Authenticate callers, constrain actions, reject stale/replayed commands, and prevent arbitrary remote execution. |
 
-Responses distinguish `Accepted`, `InProgress`, `Succeeded`, `Rejected`, and `OutcomeUnknown`. Every action takes a topology/cluster identity, operation UID, step ID, expected term, and preconditions. After a lost response the runtime exposes enough state to discover whether the action occurred.
+Responses distinguish `Accepted`, `InProgress`, `Succeeded`, `Rejected`, and `OutcomeUnknown`. Every action takes a topology/cluster identity, operation UID, step ID, expected term, and preconditions. After a lost response the instance manager exposes enough state to discover whether the action occurred.
 
-Only the runtime starts PostgreSQL. A pod recreation checks current regional control state before starting writable PostgreSQL; a volume marker or old environment variable is not current authority. The runtime supervises the server for the full pod lifetime and handles termination signals, logs, and backup-engine integration.
+Only the Postgres instance manager starts PostgreSQL. A pod recreation checks current regional control state before starting writable PostgreSQL; a volume marker or old environment variable is not current authority. The instance manager supervises the server for the full pod lifetime and handles termination signals, logs, and backup-engine integration.
 
 ## Native instance manager requirements
 
-If selected, the native manager runs as the parent process of PostgreSQL. Regional controllers coordinate candidate selection; the runtime enforces process authority and performs the actual transition. A controller lease is not itself a database write lease.
+If selected, the native manager runs as the parent process of PostgreSQL. Regional controllers coordinate candidate selection; the instance manager enforces process authority and performs the actual transition. A controller lease is not itself a database write lease.
 
-The local protocol must define renewal deadlines, monotonic timing, restart behavior, process pause behavior, network partitions, and node reboot. Expiry causes the runtime to stop writable PostgreSQL, but safe promotion still requires proof that a stalled previous writer cannot resume. The proof may be confirmed shutdown with durable inhibition or an effective infrastructure fence.
+The local protocol must define renewal deadlines, monotonic timing, restart behavior, process pause behavior, network partitions, and node reboot. Expiry causes the instance manager to stop writable PostgreSQL, but safe promotion still requires proof that a stalled previous writer cannot resume. The proof may be confirmed shutdown with durable inhibition or an effective infrastructure fence.
 
 The first implementation favors a conservative, serialized promotion workflow. Automatic takeover is disabled for installation profiles that cannot meet its fencing conditions. It does not claim safety merely because two Kubernetes processes believe they hold different lease terms.
 
-The runtime keeps a local journal on persistent storage for step recovery, with checksummed records and durable writes at destructive boundaries. The regional API control record remains the authorization source. Conflicts between the local journal and API state cause a hold and investigation rather than choosing whichever has a larger integer.
+The instance manager keeps a local journal on persistent storage for step recovery, with checksummed records and durable writes at destructive boundaries. The regional API control record remains the authorization source. Conflicts between the local journal and API state cause a hold and investigation rather than choosing whichever has a larger integer.
 
 ## Patroni integration requirements
 
@@ -65,8 +69,8 @@ Use the same two- or three-Kubernetes-cluster test harness and client commit led
 5. Local primary loss while a remote durable copy is ahead of the proposed local candidate.
 6. A crash during every acknowledgement membership transition step.
 7. A WAN partition followed by attempted regional promotion and return of the old region.
-8. Runtime and operator restart during maintenance, rewind, and upgrade.
+8. Postgres instance manager and operator restart during maintenance, rewind, and upgrade.
 
 Reject a candidate that permits two writers, drops a policy-covered acknowledged transaction, silently weakens durability, or cannot distinguish uncertain command outcomes. Then compare implementation size, operational dependencies, recovery clarity, upgrade compatibility, and measured control-plane cost.
 
-Select the runtime before implementing production automatic failover. API scaffolding, providers, observation, backups, and manually exercised prototype workflows can proceed while this decision is open. The native instance manager is a credible design option, but its safety properties must be established by the protocol review and tests rather than inferred from sharing the operator's codebase.
+Select the Postgres instance manager implementation before implementing production automatic failover. API scaffolding, providers, observation, backups, and manually exercised prototype workflows can proceed while this decision is open. The native instance manager is a credible design option, but its safety properties must be established by the protocol review and tests rather than inferred from sharing the operator's codebase.

@@ -4,7 +4,7 @@ Status: Draft schema and examples
 
 API group: `postgres.example.com/v1alpha1` pending selection of a domain controlled by the project
 
-The examples specify proposed behavior; CRDs and controllers do not yet exist. Registry digests, cluster identities, bucket names, and Secret references are placeholders. API defaults and enums below are proposed implementation decisions.
+The examples below specify the broader proposed API. An initial single-instance `PostgresCluster` CRD and regional controller now exist; see the [implemented API types](../api/v1alpha1/postgrescluster_types.go), [deployable sample](../config/samples/postgrescluster.yaml), and [implementation limits](../README.md#implemented-scope). Registry digests, cluster identities, bucket names, and Secret references below are placeholders. Defaults and enums below describe the target design unless included in that implemented subset.
 
 ## Public resources
 
@@ -28,12 +28,12 @@ Use standard metadata, status subresources, observed generations, condition tran
 | --- | --- |
 | `spec.region` | Immutable logical region identity, validated against installation configuration. |
 | `spec.postgres.majorVersion` | Desired PostgreSQL major; changes are staged and activated only through a matching authorized upgrade workflow. |
-| `spec.postgres.image` | Digest-pinned runtime image with matching, verified PostgreSQL and extension metadata. |
+| `spec.postgres.image` | Digest-pinned Postgres image containing PostgreSQL and its instance manager, with matching, verified PostgreSQL and extension metadata. |
 | `spec.instances` | Total number of PostgreSQL instances, including the primary or standby ingress. Minimum one. |
 | `spec.storage.data` | Storage class, requested capacity, and volume options. Growth is allowed; class changes use migration. |
 | `spec.resources` | PostgreSQL container requests and limits. |
 | `spec.placement` | Node selectors, tolerations, affinity, and topology spread. |
-| `spec.postgres.parameters` | User-manageable PostgreSQL settings; protected replication/runtime parameters are rejected. |
+| `spec.postgres.parameters` | User-manageable PostgreSQL settings; protected replication and HA parameters are rejected. |
 | `spec.bootstrap` | Exactly one of `initdb`, `restore`, or `standby`; immutable once data initialization starts. |
 | `spec.replication.local` | `mode: Asynchronous\|Synchronous` and `requiredStandbys` for local durable copies. |
 | `spec.backup` | Repository reference, schedules, time zone, retention, and verification policy. |
@@ -44,7 +44,7 @@ Use standard metadata, status subresources, observed generations, condition tran
 | `spec.deletionPolicy` | `Retain` by default; explicit destructive policy is separately authorized. |
 | `spec.management` | Controller-owned topology binding for global members; omitted for standalone clusters. |
 
-An image change within a major version is planned as a minor/runtime update. A major-version change records `UpgradeRequired` until a matching operation is authorized. Normal reconciliation continues from the last effective configuration; it does not prematurely start the new image. For global members, the topology planner controls when each regional desired version is advanced.
+An image change within a major version uses the rolling Postgres update workflow. A major-version change records `UpgradeRequired` until a matching operation is authorized. Normal reconciliation continues from the last effective configuration; it does not prematurely start the new image. For global members, the topology planner controls when each regional desired version is advanced.
 
 `bootstrap.restore` identifies a repository, immutable backup ID or permitted selection rule, source incarnation, and optional recovery target. Recovery target time, LSN, or restore point is a tagged union with explicit timeline and inclusivity. `bootstrap.standby` references an archive source, a streaming source, or both, and remains in recovery. An existing cluster cannot be changed into a fresh restore by editing bootstrap fields.
 
@@ -60,7 +60,7 @@ spec:
   region: eu-west-1
   postgres:
     majorVersion: 17
-    image: registry.example.com/postgres-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    image: registry.example.com/postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000
     parameters:
       max_connections: "200"
   instances: 3
@@ -139,7 +139,7 @@ spec:
   template:
     postgres:
       majorVersion: 17
-      image: registry.example.com/postgres-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: registry.example.com/postgres@sha256:0000000000000000000000000000000000000000000000000000000000000000
     instances: 3
     storage:
       data:
@@ -261,7 +261,7 @@ Operations target either a topology in the management cluster or a standalone re
 | `spec.reason` | Human-readable audit reason. Mandatory for loss acceptance or policy reduction. |
 | `spec.cancelRequested` | The only ordinarily mutable execution field; honored only at safe cancellation points. |
 
-Creating an `Execute` operation is the authorization to run it, subject to RBAC, admission, maintenance, and runtime preconditions. There is no second implicit approval flag. A plan is a snapshot: execution must revalidate its target UID, effective revision, and state.
+Creating an `Execute` operation is the authorization to run it, subject to RBAC, admission, maintenance, and Postgres management preconditions. There is no second implicit approval flag. A plan is a snapshot: execution must revalidate its target UID, effective revision, and state.
 
 Admission checks operation permissions against the target. In particular, ordinary permission to create an operation does not authorize loss acceptance: the webhook issues a SubjectAccessReview for an additional `accept-data-loss` action on the target resource. Equivalent checks govern destructive deletion and reduced-durability changes. This is an explicit admission policy, not an assumption that Kubernetes RBAC understands arbitrary spec fields.
 
@@ -288,7 +288,7 @@ spec:
   reason: Planned regional maintenance
 ```
 
-Each execution uses target UID plus operation UID as its durable identity. Controller-generated regional step identities also include epoch and step ID. Spec changes do not silently retarget an in-flight operation. Progress cannot be forged by editing a public status field; protected control state and runtime evidence authorize each step.
+Each execution uses target UID plus operation UID as its durable identity. Controller-generated regional step identities also include epoch and step ID. Spec changes do not silently retarget an in-flight operation. Progress cannot be forged by editing a public status field; protected control state and evidence from the Postgres instance manager authorize each step.
 
 ## Backup and campaign requests
 
@@ -317,7 +317,7 @@ spec:
       fleet: customer-facing
   target:
     majorVersion: 18
-    image: registry.example.com/postgres-runtime@sha256:1111111111111111111111111111111111111111111111111111111111111111
+    image: registry.example.com/postgres@sha256:1111111111111111111111111111111111111111111111111111111111111111
   execution: Plan
   rollout:
     canaryCount: 1
@@ -336,14 +336,14 @@ Campaign selection is restricted to the namespace and frozen into target UIDs at
 
 ## Status and conditions
 
-Cluster status includes `observedGeneration`, effective configuration hash, actual PostgreSQL/runtime version, bootstrap state, instance identities, writer/ingress identity, local term, volume state, and operation reference. Topology status additionally includes the authoritative writer region, epoch, per-region observation age, committed durability revision, and aggregate protection state.
+Cluster status includes `observedGeneration`, effective configuration hash, actual PostgreSQL and instance manager versions, bootstrap state, instance identities, writer/ingress identity, local term, volume state, and operation reference. Topology status additionally includes the authoritative writer region, epoch, per-region observation age, committed durability revision, and aggregate protection state.
 
 | Condition | Meaning when true |
 | --- | --- |
 | `Available` | The intended client service is currently usable. Standby-only regional availability is read availability. |
 | `Ready` | Desired configuration is reconciled and required operational checks pass. |
 | `ReplicationHealthy` | Required replication paths meet the configured policy within fresh observations. |
-| `DurabilitySatisfied` | The runtime reports the configured acknowledgement set effective and available. This is not a per-transaction audit. |
+| `DurabilitySatisfied` | The Postgres instance manager reports the configured acknowledgement set effective and available. This is not a per-transaction audit. |
 | `BackupReady` | At least one verified recovery artifact meets the backup policy. |
 | `ProtectionRestored` | Required replica placement, durability, and post-operation recovery protection are restored. |
 | `Degraded` | Service or protection differs from the desired policy. |
@@ -351,7 +351,7 @@ Cluster status includes `observedGeneration`, effective configuration hash, actu
 
 Missing observations are `Unknown`, never implicitly true. All conditions carry `observedGeneration`, reason, message, and transition time. A topology may be available while not ready; for example, it can serve writes under an asynchronous policy while an optional replica is rebuilding.
 
-Operation status includes phase, current step, attempts, timestamps, source/target versions, plan fingerprint, fencing receipts, WAL evidence, and a recovery action. Jobs and logs are referenced by UID. High-frequency WAL samples belong in metrics; API status updates are coalesced with a documented freshness bound. Safety decisions query fresh runtime evidence.
+Operation status includes phase, current step, attempts, timestamps, source/target versions, plan fingerprint, fencing receipts, WAL evidence, and a recovery action. Jobs and logs are referenced by UID. High-frequency WAL samples belong in metrics; API status updates are coalesced with a documented freshness bound. Safety decisions query fresh evidence from the Postgres instance manager.
 
 ## Admission and defaulting
 
@@ -365,7 +365,7 @@ Required checks include:
 4. Unique stable regions and instances; valid registered destination and namespace.
 5. Required synchronous regions exist, differ from the future primary, and support direct streaming.
 6. Complete `whenPrimary` mappings for eligible writer regions; no automatic policy reduction.
-7. No direct mutation of protected runtime, authority, or acknowledgement-set fields.
+7. No direct mutation of protected Postgres management, authority, or acknowledgement-set fields.
 8. No new major image activation without a matching authorized upgrade operation.
 9. No conflicting topology-level operations or independently requested disruptive work on a global member.
 10. Secret references remain within approved regional scope; fields cannot carry arbitrary credentials or shell commands.
