@@ -2,11 +2,13 @@
 
 Status: Draft for engineering review
 
+Implementation status: the first regional controller supports a single PostgreSQL 17 instance with direct Pod/PVC management. See [current scope and test commands](../README.md#implemented-scope). The HA, global coordination, and operation protocols below remain design requirements.
+
 Date: 2026-11-03
 
 Build one operator product that owns PostgreSQL lifecycle management in each Kubernetes cluster and coordinates database topologies across regions. Regional and global controllers share a codebase, image, API conventions, and release process. PostgreSQL replication and application connections run directly between database endpoints; the controllers do not proxy either traffic stream.
 
-This design fixes the responsibility boundaries and safety requirements. The PostgreSQL HA runtime remains an implementation decision governed by the [runtime contract](runtime.md). No dependency on another PostgreSQL operator is proposed.
+This design fixes the responsibility boundaries and safety requirements. The Postgres instance manager remains an implementation decision governed by the [Postgres management contract](postgres.md#postgres-management-contract). No dependency on another PostgreSQL operator is proposed.
 
 ## Requirements and decisions
 
@@ -33,6 +35,8 @@ Active-active writes, transparent transaction replay, automatic merging of diver
 
 A **topology** is one database dataset distributed across regions. A **regional cluster** is its set of PostgreSQL instances inside one Kubernetes cluster. An **instance** is a PostgreSQL process and its persistent storage. A standby region may elect a **replication ingress** to receive upstream WAL and serve cascading replicas; this role does not permit writes.
 
+The **Postgres component** contains the database server and its **instance manager**, which supervises the process and executes authorized HA actions.
+
 The binary supports three deployment modes:
 
 | Mode | Enabled responsibilities | Placement |
@@ -53,13 +57,13 @@ flowchart TB
     Global --> BAPI[Region B Kubernetes API]
     subgraph A[Region A]
         AAPI --> RA[Regional controllers]
-        RA --> AP[Primary runtime]
-        RA --> AR[Local standby runtimes]
+        RA --> AP[Primary Postgres]
+        RA --> AR[Local standby Postgres]
         AP --> AR
     end
     subgraph B[Region B]
         BAPI --> RB[Regional controllers]
-        RB --> BR[Remote standby runtimes]
+        RB --> BR[Remote standby Postgres]
     end
     AP -->|Direct streaming sync or async| BR
     AP -->|Backup and WAL| Store[Object repositories]
@@ -77,16 +81,16 @@ Existing reads, writes, streaming, and WAL archiving do not need the global reco
 | Global operation controller | Regional role transitions and topology-wide disruptive operations. | Reserves operation ownership, records epochs, issues scoped steps. |
 | Campaign controller | Selection and scheduling of topology upgrades. | Creates one operation per selected topology. |
 | Regional cluster controller | Instance inventory and Kubernetes resource lifecycle. | Creates pods, PVCs, Services, policies, and configuration. |
-| Regional operation controller | Execution and observation of authorized regional steps. | Invokes the runtime, jobs, and fencing; reports durable results. |
+| Regional operation controller | Execution and observation of authorized regional steps. | Invokes the Postgres instance manager, jobs, and fencing; reports durable results. |
 | Backup controller | Backup scheduling, completion verification, and retention coordination. | Creates backup jobs and backup records. |
 | Access controller | Managed SQL roles, databases, and credential publication. | Writes SQL only to the authorized primary. |
-| Runtime | PostgreSQL process supervision and execution of its certified HA protocol. | Applies configuration, starts/stops, reports WAL state, and performs authorized promotions. |
+| Postgres | Database process supervision and execution of its certified HA protocol through the instance manager. | Applies configuration, starts/stops, reports WAL state, and performs authorized promotions. |
 
-The global controllers never mutate database pods, PVCs, or runtime configuration directly. They render a `PostgresCluster` spec or issue a `PostgresRegionAssignment`. Regional controllers are the only Kubernetes resource managers for that cluster. The runtime is the only component permitted to start or promote PostgreSQL.
+The global controllers never mutate database pods, PVCs, or Postgres configuration directly. They render a `PostgresCluster` spec or issue a `PostgresRegionAssignment`. Regional controllers are the only Kubernetes resource managers for that cluster. The Postgres instance manager is the only component permitted to start or promote PostgreSQL.
 
 For a globally managed cluster, users edit the topology template and regional overrides. Admission rejects direct edits to fields owned by global reconciliation. Standalone regional clusters remain supported. Adoption into a topology requires an explicit operation, identity checks, and a period with no conflicting operation.
 
-Controller ownership is defined per field and resource. The runtime selection must also designate exactly one local election mechanism. A Patroni implementation, for example, cannot be combined with a second independent regional election algorithm.
+Controller ownership is defined per field and resource. The Postgres instance manager selection must also designate exactly one local election mechanism. A Patroni implementation, for example, cannot be combined with a second independent regional election algorithm.
 
 ## Cross-cluster control and authority
 
@@ -100,7 +104,7 @@ Three restricted internal resources make control state durable:
 | --- | --- | --- |
 | `PostgresTopologyControl` | Management cluster | Authority identity, topology epoch, writer region, active operation, and committed durability configuration. |
 | `PostgresRegionAssignment` | Regional cluster | Region role, topology identity, authority identity, epoch, desired revision, and authorized operation steps. |
-| `PostgresClusterControl` | Regional cluster | Instance identities, PVC bindings, local writer term, runtime state, operation ownership, and durability evidence. |
+| `PostgresClusterControl` | Regional cluster | Instance identities, PVC bindings, local writer term, Postgres state, operation ownership, and durability evidence. |
 
 These records are protocol state and must be backed up. They are not disposable caches that can safely be reconstructed from pod labels. Public status summarizes them. RBAC restricts protocol-state writes to the corresponding controller identity.
 
@@ -110,7 +114,7 @@ Topology bootstrap creates the designated initial primary under an application w
 
 Membership and role changes use uncached API reads and resource-version comparisons. Watches and cached observations trigger work but do not authorize promotion. Critical commands are checked against the current authoritative operation before execution. There is no cross-cluster transaction: operations advance through acknowledged steps and preserve uncertainty after a timeout.
 
-Global controller leader election reduces duplicate work; conditional updates and runtime guards protect against delayed former controllers. Kubernetes client-go explicitly states that its election mechanism does not itself guarantee fencing. See the [leader-election implementation](https://github.com/kubernetes/client-go/blob/master/tools/leaderelection/leaderelection.go).
+Global controller leader election reduces duplicate work; conditional updates and guards in the Postgres instance manager protect against delayed former controllers. Kubernetes client-go explicitly states that its election mechanism does not itself guarantee fencing. See the [leader-election implementation](https://github.com/kubernetes/client-go/blob/master/tools/leaderelection/leaderelection.go).
 
 Moving the management authority is an administrative migration: stop the old coordinator, revoke its regional credentials, reconcile outstanding operations, verify all regional authority bindings, then activate the new authority. Restoring an old management backup does not automatically revive its grants. Epoch numbers from two independent restored authorities cannot establish mutual exclusion.
 
@@ -131,11 +135,11 @@ These invariants are release gates. An implementation that cannot establish a pr
 
 ## Reconciliation and operation execution
 
-Controllers use Go and controller-runtime with bounded workers, event filtering, exponential backoff, and jitter. Each reconcile observes resources, evaluates invariants, computes one bounded change, applies it, and records the observation. Long-running commands execute in runtime tasks or Kubernetes Jobs rather than holding a reconcile worker.
+Controllers use Go and controller-runtime with bounded workers, event filtering, exponential backoff, and jitter. Each reconcile observes resources, evaluates invariants, computes one bounded change, applies it, and records the observation. Long-running commands execute as Postgres management tasks or Kubernetes Jobs rather than holding a reconcile worker.
 
 Operation phases are `Pending`, `Validating`, `WaitingForWindow`, `Running`, `Verifying`, and one of `Succeeded`, `Failed`, `Cancelled`, or `NeedsIntervention`. `Blocked` is a condition with a reason, not a successful terminal state. Status records the current step, attempts, operation owner, configuration revision, evidence references, and timestamps.
 
-Every mutating step has preconditions, an idempotency key, an observable postcondition, a timeout, and a stated recovery action. The controller records intent before execution. If the API call or runtime response is lost, it inspects actual state before retrying. For example, a successful promotion with a lost response is discovered from runtime identity and timeline, not followed by a second promotion command.
+Every mutating step has preconditions, an idempotency key, an observable postcondition, a timeout, and a stated recovery action. The controller records intent before execution. If the API call or instance manager response is lost, it inspects actual state before retrying. For example, a successful promotion with a lost response is discovered from instance identity and PostgreSQL timeline, not followed by a second promotion command.
 
 The topology reservation persists across controller crashes. A new leader resumes or investigates the same operation; a timeout does not automatically permit a conflicting operation. Cancellation is allowed only at documented safe points. After a promotion or an irreversible upgrade boundary, cancellation means stopping further steps and recovering deliberately.
 
@@ -149,7 +153,7 @@ Data PVCs are operator-created and retained independently of pod lifetimes. Init
 
 New instances bootstrap from a healthy source or a verified backup. Removal selects a non-writer outside the required acknowledgement set, updates membership safely, then stops its process. A lost node or uncertain attachment is fenced before its identity or volume can be reused. A single-writer volume access mode is useful but does not replace fencing.
 
-Production placement spreads instances across nodes and availability zones. Requests, limits, scheduling constraints, disruption budgets, and termination grace periods are part of the cluster template. Disruption budgets are supplemented by runtime-aware maintenance checks; they do not govern all direct pod deletions or involuntary failures.
+Production placement spreads instances across nodes and availability zones. Requests, limits, scheduling constraints, disruption budgets, and termination grace periods are part of the cluster template. Disruption budgets are supplemented by maintenance checks that inspect Postgres state; they do not govern all direct pod deletions or involuntary failures.
 
 For expansion, the controller validates growth, patches existing PVC requests, and waits for both reported capacity and mounted filesystem size. A storage-only change does not alter the pod template. `RestartRequired` is reported if online expansion is unavailable; the operator does not silently restart to satisfy a no-restart request. Shrink requests are rejected. Storage-class changes require migration to new volumes.
 
@@ -169,7 +173,7 @@ Local and remote policy are separate. `local.requiredStandbys` expresses require
 
 The first synchronous implementation uses an exact acknowledgement set: the selected local standbys plus one selected direct receiver in every required remote region. All selected members must acknowledge. For example, one local standby and one remote receiver compile to `ANY 2 (local_member, remote_member)`. Including a second local member as an alternative would let both acknowledgements come from the primary region and is therefore forbidden. Arbitrary regional quorum expressions are deferred.
 
-Names are derived from immutable instance identities, not reused regional aliases. The runtime verifies that replication connections match assigned instances. PostgreSQL's `ANY` count counts connections, not regions, and does not itself enforce unique standby names. See [synchronous standby configuration](https://www.postgresql.org/docs/current/runtime-config-replication.html).
+Names are derived from immutable instance identities, not reused regional aliases. The Postgres instance manager verifies that replication connections match assigned instances. PostgreSQL's `ANY` count counts connections, not regions, and does not itself enforce unique standby names. See [synchronous standby configuration](https://www.postgresql.org/docs/current/runtime-config-replication.html).
 
 Use `synchronous_commit=on` for durable remote WAL; `remote_apply` is optional when the application needs replay acknowledgement. Both require an effective nonempty synchronous standby set. Applications can override `synchronous_commit`, so durability claims cover transactions using the configured policy, not arbitrary session overrides. `remote_write` is not accepted for the durable-copy contract. See [PostgreSQL commit durability settings](https://www.postgresql.org/docs/18/runtime-config-wal.html).
 
@@ -180,7 +184,7 @@ Loss of a required receiver blocks policy-compliant commits. Asynchronous mode c
 The first implementation serializes membership changes and briefly quiesces application writes instead of implementing a novel online quorum transition:
 
 1. Reserve the operation and record the old and proposed sets in authoritative control state.
-2. Enforce a write hold that stops new application sessions and resolves existing writers. A SQL default-read-only setting alone is insufficient. Runtime shutdown under a maintenance hold is the conservative implementation when a live gate cannot be proved.
+2. Enforce a write hold that stops new application sessions and resolves existing writers. A SQL default-read-only setting alone is insufficient. PostgreSQL shutdown by the instance manager under a maintenance hold is the conservative implementation when a live gate cannot be proved.
 3. Establish a final durable WAL boundary, including transactions with uncertain client outcomes. Verify the PostgreSQL system identity and timeline history.
 4. Bring every member of the new set to that boundary. If required data or a member is unavailable, stop here.
 5. Apply the exact new configuration, verify it, and durably commit the new configuration revision in both management and regional control state while writes remain held.
@@ -196,13 +200,13 @@ Status distinguishes observed lag from promotion evidence. LSNs are compared onl
 
 ## Local HA and fencing
 
-In an asynchronous remote topology, a regional runtime may perform automatic local failover under its certified protocol and current region assignment. It must fence the old writer and respect any local synchronous policy. In a globally synchronous topology, a promotion is coordinated with the authoritative acknowledgement configuration; it can block on management availability.
+In an asynchronous remote topology, the regional Postgres instance managers may perform automatic local failover under their certified protocol and current region assignment. They must fence the old writer and respect any local synchronous policy. In a globally synchronous topology, a promotion is coordinated with the authoritative acknowledgement configuration; it can block on management availability.
 
 The local sequence is: detect failure, acquire operation ownership, identify the current term and durability revision, stop or fence the previous writer, establish candidate eligibility, bring the candidate to the required WAL boundary, authorize promotion, verify the new timeline and policy, and publish the writer endpoint.
 
 Synchronous eligibility requires evidence that the candidate contains the acknowledged history. A recorded required member of an unchanged exact set can supply that history; a candidate outside the set must catch up from a verified durable holder. Missing or partially transitioned membership records cause `DurabilityProofUnavailable`. All known required durable copies being unavailable causes a lossless operation to block.
 
-The runtime renews its local authority and stops writable PostgreSQL when local authorization is lost according to its certified protocol. Process stalls can defeat a software renewal loop, so a new writer still requires independently adequate fencing or confirmed process shutdown plus durable restart inhibition. A new process never starts writable using only a cached grant.
+The Postgres instance manager renews its local authority and stops writable PostgreSQL when local authorization is lost according to its certified protocol. Process stalls can defeat a software renewal loop, so a new writer still requires independently adequate fencing or confirmed process shutdown plus durable restart inhibition. A new process never starts writable using only a cached grant.
 
 Fencing adapters return evidence bound to the topology, region, instance/node identities, authority epoch, operation, enforcement scope, and verification time. Regional fencing covers every instance that could become writable and prevents replacement infrastructure from reviving the old writer role. A completed Kubernetes deletion alone is not accepted as infrastructure evidence.
 
@@ -230,7 +234,7 @@ sequenceDiagram
     G->>A: Rejoin as standby while old writer remains inhibited
 ```
 
-Stopping applications at a proxy is helpful but is not the write fence. Existing database connections are drained or terminated by the runtime procedure. Clients must reconnect after the transition and handle transactions whose outcome was uncertain.
+Stopping applications at a proxy is helpful but is not the write fence. Existing database connections are drained or terminated by the Postgres instance manager's procedure. Clients must reconnect after the transition and handle transactions whose outcome was uncertain.
 
 If the target cannot satisfy the future synchronous policy, promotion may remain administratively isolated until the required standby is rebuilt, or the operation remains blocked before promotion. The operator never advertises write readiness while policy-compliant commits cannot complete. A policy change to accept weaker durability must be separately authorized and recorded.
 
@@ -244,7 +248,7 @@ The initial policy requires an explicit `Failover` operation; automated detectio
 2. Establishes an effective regional fence. `AwaitingFencing` blocks promotion when this cannot be verified.
 3. Evaluates target identity, timeline, available WAL, durability configuration, and the requested data-loss policy.
 4. Recovers all required available WAL and records the evidence or the explicit acceptance of potentially lost transactions.
-5. Advances the topology epoch, issues one promotion grant, verifies the new runtime role and future durability policy, then updates endpoints.
+5. Advances the topology epoch, issues one promotion grant, verifies the new Postgres role and future durability policy, then updates endpoints.
 6. Quarantines the old region until it can safely rejoin.
 
 `Lossless` requires proof. `AllowPotentialDataLoss` is a privileged operation setting with an audit reason; it does not waive fencing. Stale replication metrics cannot establish losslessness. DNS publication is tracked separately from database promotion because it can fail or converge slowly.
@@ -275,7 +279,7 @@ Snapshots are an optional acceleration path. A CSI snapshot does not, by itself,
 
 ## Configuration changes and minor upgrades
 
-The planner classifies differences into reloadable settings, restart-required settings, pod replacement, storage growth, membership change, and major upgrade. Protected settings such as replication identities and authority-related runtime configuration are not arbitrary user overrides.
+The planner classifies differences into reloadable settings, restart-required settings, pod replacement, storage growth, membership change, and major upgrade. Protected settings such as replication identities and configuration governing instance manager authority are not arbitrary user overrides.
 
 For a minor image update, validate image/extension compatibility, update asynchronous replicas in controlled batches, verify health and replay progress, safely rotate required synchronous members, switch to an updated eligible local standby, and update the former primary. Remote receivers are included in the plan. Standbys should be upgraded before the primary where supported by the release notes. See [PostgreSQL minor replication compatibility](https://www.postgresql.org/docs/current/warm-standby.html).
 
@@ -309,9 +313,9 @@ Role catalog changes reach physical replicas through replication. Kubernetes Sec
 
 Password changes have a staged publication protocol and status showing database-applied and Secret-published versions. PostgreSQL has one password per login role; a seamless overlap requires rotating between login roles with inherited privileges and application support. The initial profile supports a maintenance-coordinated single-login rotation; dual-login rotation is an optional later feature. Deleting a manifest entry disables managed login access under policy and retains data; destructive role/database removal is explicit.
 
-TLS covers client SQL, streaming replication, runtime management, and cross-cluster control. Custom certificate references include certificate/key and CA material. Validate key matching, expiry, hostname coverage, and trust before activation. Reload certificates atomically and retain the last usable material on failure. CA rotation uses a trust-overlap period followed by certificate replacement and final removal of old trust.
+TLS covers client SQL, streaming replication, the Postgres management API, and cross-cluster control. Custom certificate references include certificate/key and CA material. Validate key matching, expiry, hostname coverage, and trust before activation. Reload certificates atomically and retain the last usable material on failure. CA rotation uses a trust-overlap period followed by certificate replacement and final removal of old trust.
 
-Runtime management endpoints require mutual authentication and reject arbitrary command execution. Service accounts, NetworkPolicies, private endpoints, non-root containers, restrictive filesystem permissions, and namespace-scoped RBAC are part of the supported deployment profile. Backup credentials are separate from application credentials. Kubernetes control state and Secrets require encrypted backups and an access policy suitable for the tenant boundary.
+Postgres management endpoints require mutual authentication and reject arbitrary command execution. Service accounts, NetworkPolicies, private endpoints, non-root containers, restrictive filesystem permissions, and namespace-scoped RBAC are part of the supported deployment profile. Backup credentials are separate from application credentials. Kubernetes control state and Secrets require encrypted backups and an access policy suitable for the tenant boundary.
 
 ## Provider interfaces and AWS integration
 
@@ -341,7 +345,7 @@ Remote read endpoints may be stale in asynchronous mode. `remote_apply` acknowle
 
 ## Observability and operating limits
 
-Public status reports observed generation, per-region freshness, actual writer identity, authority epoch, runtime version, system identifier, timeline, received/flushed/replayed WAL positions, effective durability revision, last verified backup, and operation progress. `Ready`, `Available`, `ReplicationHealthy`, `DurabilitySatisfied`, `BackupReady`, `ProtectionRestored`, and `Degraded` have distinct meanings defined in the API document.
+Public status reports observed generation, per-region freshness, actual writer identity, authority epoch, PostgreSQL and instance manager versions, system identifier, timeline, received/flushed/replayed WAL positions, effective durability revision, last verified backup, and operation progress. `Ready`, `Available`, `ReplicationHealthy`, `DurabilitySatisfied`, `BackupReady`, `ProtectionRestored`, and `Degraded` have distinct meanings defined in the API document.
 
 Expose metrics for reconciliation duration and errors, API throttling, cache size, queue depth, operation age, WAL retention, replication lag, synchronous commit waits, backup freshness, restore verification, PVC usage, certificate expiry, and fencing outcomes. Keep per-operation identifiers in structured logs rather than unbounded Prometheus labels.
 
@@ -357,8 +361,8 @@ Bound cached resource types and namespaces. Use per-cluster client limits, per-t
 | --- | --- |
 | Global operator restart | Resume durable operations; no duplicate promotion or upgrade. |
 | Management API unavailable | Stable data paths continue; global transitions and required sync membership changes wait. |
-| Regional operator unavailable | Runtime behavior follows its certified local protocol; ordinary Kubernetes reconciliation pauses. |
-| Regional Kubernetes API lost | Runtime follows local authority-loss rules; no new writer is assumed safe from API absence alone. |
+| Regional operator unavailable | The Postgres instance manager follows its certified local protocol; ordinary Kubernetes reconciliation pauses. |
+| Regional Kubernetes API lost | The Postgres instance manager follows local authority-loss rules; no new writer is assumed safe from API absence alone. |
 | WAN partition under async policy | Current primary may continue writing; remote state becomes stale; no timeout-only remote promotion. |
 | WAN partition under sync policy | Required commits block; no automatic async fallback. |
 | Old writer node suspended | New writer waits for an effective fence or verified shutdown. |
@@ -381,6 +385,6 @@ Management and regional control records, CRDs, identity bindings, and secret-rec
 
 ## Implementation boundaries
 
-Proposed packages are `api`, `controllers/regional`, `controllers/global`, `operations`, `runtime`, `replication`, `backup`, `providers`, `security`, and `observability`. The command exposes deployment mode and scope; it does not select arbitrary untested runtime plugins.
+Proposed packages are `api`, `controllers/regional`, `controllers/global`, `operations`, `postgres`, `replication`, `backup`, `providers`, `security`, and `observability`. The command exposes deployment mode and scope; it does not select arbitrary untested Postgres instance manager implementations.
 
-The operation planner and safety predicates should be testable independently of Kubernetes clients. Provider and runtime interfaces isolate side effects for deterministic failure injection. Initial implementation certifies one runtime, one PostgreSQL version pair, and one AWS storage/fencing profile. The [delivery plan](delivery-plan.md) defines the gates before expanding that matrix.
+The operation planner and safety predicates should be testable independently of Kubernetes clients. Provider and Postgres management interfaces isolate side effects for deterministic failure injection. Initial implementation certifies one Postgres instance manager implementation, one PostgreSQL version pair, and one AWS storage/fencing profile.

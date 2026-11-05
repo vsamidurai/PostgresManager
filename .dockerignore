@@ -1,0 +1,5 @@
+.git
+bin
+.test-cache
+coverage.out
+docs
