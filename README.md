@@ -11,15 +11,15 @@ The initial implementation is a regional, single-instance `PostgresCluster` cont
 - A namespaced `postgres.example.com/v1alpha1` CRD with defaults, validation, and a status subresource.
 - Exactly one writable instance, using the official `postgres:17-bookworm` image contract. Compatible digest-pinned images can be supplied at creation.
 - A same-namespace bootstrap Secret containing the `postgres` superuser password. The Pod reads it from a file, runs as UID 999, and has no Kubernetes API token.
-- Data checksums by default, a restricted set of initial PostgreSQL parameters, and startup/primary readiness checks.
+- Data checksums by default, a restricted set of initial PostgreSQL parameters (up to 1,024 characters per value), and startup/primary readiness checks.
 - Durable bootstrap records, Pod/PVC UID checks, and a data-volume identity marker. Reusing a cluster name creates a new storage identity.
 - PVC expansion when the StorageClass allows it, without replacing the Pod. Status waits for reported capacity and filesystem expansion; this is not yet an AWS CSI certification.
-- `Ready`, `Available`, and `Blocked` conditions, controller leader election, generated RBAC, and deployment manifests.
+- `Ready`, `Available`, and `Blocked` conditions, controller leader election, generated RBAC, and deployment manifests. Healthy clusters reconcile on resource events; watches cache only managed Pods, PVCs, Services, and ConfigMaps. Bootstrap and identity checks use direct API reads.
 - Retained PVCs and user-owned Secrets when a cluster is deleted.
 
 This is a development foundation. Replication, failover, automatic Pod replacement, image/configuration updates, backup/restore, TLS, application roles, password rotation, and global controllers are not implemented. `instances` must be `1`; initial configuration is immutable except storage growth. Updating the bootstrap Secret does not rotate the database password.
 
-If an established Pod, PVC, or bootstrap record disappears, the controller reports `RecoveryRequired`. It does not recreate an empty database or assume an old process has stopped. A repair operation will be implemented separately. The kubelet can still restart a container within its existing Pod. An interrupted initial resource-creation request can also require investigation if its outcome cannot be established.
+If an established Pod, PVC, or bootstrap record disappears, the controller reports `RecoveryRequired`. It does not recreate an empty database or assume an old process has stopped. A repair operation will be implemented separately. The kubelet can still restart a container within its existing Pod. An interrupted initial resource-creation request can also require investigation if its outcome cannot be established. Definitively rejected creates, such as quota or admission rejections, are retried after their intent is safely reset. A persisted 30-second delay prevents checkpoint events or leader handover from causing rapid retries. An uncertain response never authorizes recreating a missing Pod or PVC.
 
 The initial database container uses the official image's entrypoint plus a bootstrap guard. The full HA instance-manager contract in the design is not implemented or selected by this bootstrap slice. The API group is provisional and must be replaced with a project-controlled domain before a stable release.
 
@@ -33,9 +33,18 @@ make test
 make test-e2e
 ```
 
-`make test` runs vet, race-enabled unit tests, and integration tests against a real Kubernetes API server and etcd using envtest. It covers admission, idempotency, resource identity, missing resources, capacity changes, and retention. Envtest does not run database containers or a CSI driver.
+`make test` runs vet, race-enabled unit tests, and integration tests against a real Kubernetes API server and etcd using envtest. It covers admission, idempotency, resource identity, missing resources, capacity changes, retention, rejected and ambiguous API writes, concurrent reconciles, Service readiness drift, and watch-driven reconciliation of 21 clusters. It also verifies cache filtering, namespace scope, readiness transitions, and finalization through a running manager. Envtest does not run database containers or a CSI driver.
 
-`make test-e2e` creates a disposable Kind cluster with a separate kubeconfig. It builds and deploys the operator, boots Postgres, connects through its writer Service, commits data, restarts the operator and database container, verifies persistence, checks missing-Pod behavior and deletion retention, then removes the test cluster. It never uses the caller's current Kubernetes context.
+`make test-e2e` creates a disposable Kind cluster with a separate kubeconfig and checks:
+
+- PostgreSQL bootstrap, authenticated Service connections, configuration, and SQL writes.
+- Scaling the controller deployment from one to three replicas, two elected-leader deletions, and reconciliation by each successor without replacing the database.
+- Operator rolling restart and PostgreSQL container restart with persistent Pod/PVC identities.
+- An immediate PostgreSQL shutdown, WAL replay on restart, unavailable/ready transitions, and retention of acknowledged writes.
+- Recovery from a real quota-rejected Pod create without replacing the PVC.
+- Missing-primary recovery holds, removal of ready writer endpoints, deletion retention, and restricted service-account permissions.
+
+The test removes its cluster afterward and never uses the caller's current Kubernetes context. Controller leader handover and PostgreSQL crash recovery are covered; standby promotion, node fencing, multi-region failover, and database replica scale-up are not implemented or tested. Increasing `spec.instances` remains explicitly rejected.
 
 Hosts already running several clusters can exhaust their inotify instance limit before another Kind node starts. See [Kind's troubleshooting guidance](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files) if node startup reports `Too many open files`.
 
@@ -62,7 +71,7 @@ kubectl -n databases port-forward service/example-rw 5432:5432
 
 Connect to `localhost:5432`, database `postgres`, user `postgres`, using the bootstrap password. This first implementation provides password authentication without TLS. Use strict manifest validation so unsupported fields from the broader design are not silently pruned.
 
-For an in-cluster operator, build/publish an image or load it into Kind, update the image in `config/manager/manager.yaml`, and apply `config/default`. The deployment enables leader election. `make run` disables election for local development; run only one such manager. The binary also accepts `--watch-namespace` to limit reconciliation.
+For an in-cluster operator, build/publish an image or load it into Kind, update the image in `config/manager/manager.yaml`, and apply `config/default`. The deployment enables leader election; additional controller replicas are standbys for availability, and only the lease holder reconciles. Readiness checks cache synchronization without requiring leadership. `make run` disables election for local development; run only one such manager. The binary also accepts `--watch-namespace` to limit reconciliation.
 
 Deleting a `PostgresCluster` gracefully deletes its owned Pod and retains the PVC and bootstrap Secret. Namespace deletion and storage-administrator actions can still delete that storage. Inspect `Blocked` conditions and controller logs when initialization or recovery cannot proceed; do not remove identity records to bypass a hold.
 

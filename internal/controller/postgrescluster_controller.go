@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"time"
 
@@ -17,48 +19,67 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const finalizer = "postgres.example.com/cluster-protection"
+const (
+	finalizer  = "postgres.example.com/cluster-protection"
+	retryDelay = 30 * time.Second
+)
 
 // Bootstrap state is separate from editable public status. Requests are recorded
 // before creating storage/processes: an uncertain outcome must not reinitialize
-// a database. This conservative slice requires intervention after such a failure.
+// a database. Only a definitive API rejection allows retrying a create request.
 type bootstrapState struct {
-	ContractHash string    `json:"contractHash"`
-	PVCRequested bool      `json:"pvcRequested"`
-	PVCUID       types.UID `json:"pvcUID,omitempty"`
-	PodRequested bool      `json:"podRequested"`
-	PodUID       types.UID `json:"podUID,omitempty"`
+	ContractHash string       `json:"contractHash"`
+	PVCRequested bool         `json:"pvcRequested"`
+	PVCUID       types.UID    `json:"pvcUID,omitempty"`
+	PodRequested bool         `json:"podRequested"`
+	PodUID       types.UID    `json:"podUID,omitempty"`
+	RetryAfter   *metav1.Time `json:"retryAfter,omitempty"`
 }
 
 type PostgresClusterReconciler struct {
 	client.Client
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
+	Clock     clock.PassiveClock
+}
+
+func (r *PostgresClusterReconciler) now() time.Time {
+	if r.Clock != nil {
+		return r.Clock.Now()
+	}
+	return time.Now()
 }
 
 func (r *PostgresClusterReconciler) reader() client.Reader {
+	// Bootstrap and identity decisions must observe the API server directly. A
+	// cache miss is not evidence that a database process or volume never existed.
 	if r.APIReader != nil {
 		return r.APIReader
 	}
 	return r.Client
 }
 
-// +kubebuilder:rbac:groups=postgres.example.com,resources=postgresclusters,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=postgres.example.com,resources=postgresclusters/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=postgres.example.com,resources=postgresclusters,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=postgres.example.com,resources=postgresclusters/status,verbs=get;patch
 // +kubebuilder:rbac:groups=postgres.example.com,resources=postgresclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=pods;services;configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=services;persistentvolumeclaims,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update
 
 // Reconcile applies the initial bootstrap contract without an HA election.
 func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -99,11 +120,8 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if controllerutil.ContainsFinalizer(c, finalizer) || pvc != nil || pod != nil {
 			return r.report(ctx, c, pod, pvc, "RecoveryRequired", "Bootstrap control state is missing; existing resources will not be adopted or recreated", true)
 		}
-		before := c.DeepCopy()
-		controllerutil.AddFinalizer(c, finalizer)
-		if err := r.Patch(ctx, c, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
-			return ctrl.Result{}, err
-		}
+		// Persist the empty control record before the finalizer. A rejected or
+		// interrupted ConfigMap create is safe to retry: no data exists yet.
 		cm = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: n.Control, Namespace: c.Namespace, Labels: postgres.Labels(c)}}
 		if err := controllerutil.SetControllerReference(c, cm, r.Scheme); err != nil {
 			return ctrl.Result{}, err
@@ -117,15 +135,37 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	} else if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !metav1.IsControlledBy(cm, c) || !controllerutil.ContainsFinalizer(c, finalizer) {
-		return r.report(ctx, c, pod, pvc, "OwnershipConflict", "Bootstrap record ownership or cluster protection does not match", true)
+	if !metav1.IsControlledBy(cm, c) {
+		return r.report(ctx, c, pod, pvc, "OwnershipConflict", "Bootstrap record ownership does not match", true)
+	}
+	if !cm.DeletionTimestamp.IsZero() {
+		return r.report(ctx, c, pod, pvc, "RecoveryRequired", "Bootstrap record is being deleted", true)
 	}
 	var state bootstrapState
-	if err := json.Unmarshal([]byte(cm.Data["state.json"]), &state); err != nil || state.ContractHash == "" {
+	if err := json.Unmarshal([]byte(cm.Data["state.json"]), &state); err != nil || !state.valid() {
 		return r.report(ctx, c, pod, pvc, "RecoveryRequired", "Bootstrap control state is invalid", true)
 	}
 	if state.ContractHash != postgres.ContractHash(c) {
 		return r.report(ctx, c, pod, pvc, "UpdateRequiresOperation", "Only storage growth is supported after bootstrap", true)
+	}
+	if !controllerutil.ContainsFinalizer(c, finalizer) {
+		if state.PVCRequested || pvc != nil || pod != nil {
+			return r.report(ctx, c, pod, pvc, "RecoveryRequired", "Cluster protection is missing from an established bootstrap", true)
+		}
+		before := c.DeepCopy()
+		controllerutil.AddFinalizer(c, finalizer)
+		if err := r.Patch(ctx, c, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.ensureWatchLabels(ctx, c, cm); err != nil {
+		return ctrl.Result{}, err
+	}
+	if state.RetryAfter != nil {
+		if delay := state.RetryAfter.Sub(r.now()); delay > 0 {
+			_, err := r.report(ctx, c, pod, pvc, "CreateRejected", "The API rejected resource creation; waiting before retrying (see controller logs)", true)
+			return ctrl.Result{RequeueAfter: delay}, err
+		}
 	}
 
 	if pvc == nil {
@@ -136,11 +176,16 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			return r.report(ctx, c, pod, nil, "CredentialsUnavailable", err.Error(), true)
 		}
 		state.PVCRequested = true
+		state.RetryAfter = nil
 		if err := r.saveState(ctx, cm, state); err != nil {
 			return ctrl.Result{}, err
 		}
 		pvc = postgres.PVC(c)
 		if err := r.Create(ctx, pvc); err != nil {
+			if createRejected(err) {
+				state.PVCRequested = false
+				return ctrl.Result{}, r.retryRejectedCreate(ctx, cm, state, err)
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -155,6 +200,9 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.saveState(ctx, cm, state); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if err := r.ensureWatchLabels(ctx, c, pvc); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := r.reconcileCapacity(ctx, c, pvc); err != nil {
 		return r.report(ctx, c, pod, pvc, "StorageBlocked", err.Error(), true)
@@ -172,15 +220,20 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.checkSecret(ctx, c); err != nil {
 			return r.report(ctx, c, nil, pvc, "CredentialsUnavailable", err.Error(), true)
 		}
-		state.PodRequested = true
-		if err := r.saveState(ctx, cm, state); err != nil {
-			return ctrl.Result{}, err
-		}
 		pod = postgres.Pod(c)
 		if err := controllerutil.SetControllerReference(c, pod, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
+		state.PodRequested = true
+		state.RetryAfter = nil
+		if err := r.saveState(ctx, cm, state); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.Create(ctx, pod); err != nil {
+			if createRejected(err) {
+				state.PodRequested = false
+				return ctrl.Result{}, r.retryRejectedCreate(ctx, cm, state, err)
+			}
 			return ctrl.Result{}, err
 		}
 	}
@@ -202,6 +255,9 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
 		return r.report(ctx, c, pod, pvc, "RecoveryRequired", "Postgres Pod exited; inspect it before requesting recovery", true)
 	}
+	if err := r.ensureWatchLabels(ctx, c, pod); err != nil {
+		return ctrl.Result{}, err
+	}
 	if !podReady(pod) {
 		return r.report(ctx, c, pod, pvc, "WaitingForPostgres", "Waiting for the Postgres startup and primary readiness probes", false)
 	}
@@ -216,6 +272,42 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 	return r.report(ctx, c, pod, pvc, "Reconciled", "Postgres is available and the requested resources are reconciled", false)
+}
+
+func (s bootstrapState) valid() bool {
+	return s.ContractHash != "" && (s.PVCRequested || s.PVCUID == "") &&
+		(!s.PodRequested || s.PVCUID != "") && (s.PodRequested || s.PodUID == "")
+}
+
+// Timeouts, transport failures, conflicts, and AlreadyExists are deliberately
+// excluded: the API may have accepted a create even if the response was lost.
+func createRejected(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err) ||
+		apierrors.IsBadRequest(err) || apierrors.IsUnauthorized(err)
+}
+
+func (r *PostgresClusterReconciler) retryRejectedCreate(ctx context.Context, cm *corev1.ConfigMap, state bootstrapState, cause error) error {
+	// Persist the delay because our own checkpoint watch can enqueue immediately,
+	// bypassing the workqueue's error backoff. It also survives leader handover.
+	retryAt := metav1.NewTime(r.now().Add(retryDelay))
+	state.RetryAfter = &retryAt
+	return errors.Join(cause, r.saveState(ctx, cm, state))
+}
+
+// Call only after verifying ownership/identity. Repair labels used by filtered
+// watches without adopting foreign resources or overwriting user labels.
+func (r *PostgresClusterReconciler) ensureWatchLabels(ctx context.Context, c *pgv1.PostgresCluster, object client.Object) error {
+	before := object.DeepCopyObject().(client.Object)
+	labels := maps.Clone(object.GetLabels())
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	maps.Copy(labels, postgres.Labels(c))
+	if maps.Equal(labels, object.GetLabels()) {
+		return nil
+	}
+	object.SetLabels(labels)
+	return r.Patch(ctx, object, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
 func encodeState(cm *corev1.ConfigMap, state bootstrapState) error {
@@ -294,15 +386,19 @@ func (r *PostgresClusterReconciler) reconcileService(ctx context.Context, c *pgv
 	if !metav1.IsControlledBy(current, c) {
 		return fmt.Errorf("Service %s belongs to another owner", current.Name)
 	}
+	if err := r.ensureWatchLabels(ctx, c, current); err != nil {
+		return err
+	}
 	if (current.Spec.ClusterIP == corev1.ClusterIPNone) != headless || current.Spec.Type != corev1.ServiceTypeClusterIP || len(current.Spec.ExternalIPs) != 0 {
 		return fmt.Errorf("Service %s has unsupported networking configuration", current.Name)
 	}
-	if reflect.DeepEqual(current.Spec.Selector, wanted.Spec.Selector) && reflect.DeepEqual(current.Spec.Ports, wanted.Spec.Ports) {
+	if reflect.DeepEqual(current.Spec.Selector, wanted.Spec.Selector) && reflect.DeepEqual(current.Spec.Ports, wanted.Spec.Ports) && !current.Spec.PublishNotReadyAddresses {
 		return nil
 	}
 	before := current.DeepCopy()
 	current.Spec.Selector = wanted.Spec.Selector
 	current.Spec.Ports = wanted.Spec.Ports
+	current.Spec.PublishNotReadyAddresses = false
 	return r.Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
 }
 
@@ -376,11 +472,27 @@ func (r *PostgresClusterReconciler) report(ctx context.Context, c *pgv1.Postgres
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	if reason == "Reconciled" {
+		return ctrl.Result{}, nil // Watched resource changes drive healthy clusters.
+	}
+	// Secrets and StorageClasses are read directly, never cached cluster-wide.
+	// Poll pending work so fixing these dependencies can unblock reconciliation.
+	return ctrl.Result{RequeueAfter: retryDelay}, nil
+}
+
+func clusterPredicate() predicate.Predicate {
+	return predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+		if e.ObjectOld == nil || e.ObjectNew == nil {
+			return false
+		}
+		return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+			!e.ObjectOld.GetDeletionTimestamp().Equal(e.ObjectNew.GetDeletionTimestamp()) ||
+			!reflect.DeepEqual(e.ObjectOld.GetFinalizers(), e.ObjectNew.GetFinalizers())
+	}}
 }
 
 func (r *PostgresClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).For(&pgv1.PostgresCluster{}).
+	return ctrl.NewControllerManagedBy(mgr).For(&pgv1.PostgresCluster{}, builder.WithPredicates(clusterPredicate())).
 		Owns(&corev1.Pod{}).Owns(&corev1.Service{}).Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
 			if name := object.GetLabels()[postgres.ClusterLabel]; name != "" {

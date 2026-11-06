@@ -21,13 +21,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
-var testClient client.Client
+var testClient client.WithWatch
+var testConfig *rest.Config
 var testScheme = runtime.NewScheme()
 
 func TestMain(m *testing.M) {
@@ -37,13 +40,18 @@ func TestMain(m *testing.M) {
 	}
 	_ = clientgoscheme.AddToScheme(testScheme)
 	_ = pgv1.AddToScheme(testScheme)
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 	environment := &envtest.Environment{CRDDirectoryPaths: []string{filepath.Join("..", "..", "config", "crd", "bases")}, ErrorIfCRDPathMissing: true}
+	// Fleet tests can be repeated with -count. Envtest has no namespace/GC
+	// controllers to release Service IPs between cases, so use a larger range.
+	environment.ControlPlane.GetAPIServer().Configure().Set("service-cluster-ip-range", "10.0.0.0/16")
 	cfg, err := environment.Start()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	testClient, err = client.New(cfg, client.Options{Scheme: testScheme})
+	testConfig = cfg
+	testClient, err = client.NewWithWatch(cfg, client.Options{Scheme: testScheme})
 	if err != nil {
 		_ = environment.Stop()
 		fmt.Fprintln(os.Stderr, err)
@@ -167,7 +175,7 @@ func TestAdmissionRejectsUnsupportedAndUnsafeChanges(t *testing.T) {
 		"major-upgrade": func(c *pgv1.PostgresCluster) { c.Spec.Postgres.MajorVersion = 18 },
 		"image-update":  func(c *pgv1.PostgresCluster) { c.Spec.Postgres.Image = "postgres:18" },
 		"protected-parameter": func(c *pgv1.PostgresCluster) {
-			c.Spec.Postgres.Parameters = map[string]string{"archive_command": "false"}
+			c.Spec.Postgres.Parameters = map[string]pgv1.PostgresParameterValue{"archive_command": "false"}
 		},
 		"shrink":                func(c *pgv1.PostgresCluster) { c.Spec.Storage.Data.Size = "512Mi" },
 		"storage-migration":     func(c *pgv1.PostgresCluster) { c.Spec.Storage.Data.StorageClassName = "other-class" },
