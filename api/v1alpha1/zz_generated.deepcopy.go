@@ -166,7 +166,7 @@ func (in *PostgresSpec) DeepCopyInto(out *PostgresSpec) {
 	*out = *in
 	if in.Parameters != nil {
 		in, out := &in.Parameters, &out.Parameters
-		*out = make(map[string]string, len(*in))
+		*out = make(map[string]PostgresParameterValue, len(*in))
 		for key, val := range *in {
 			(*out)[key] = val
 		}

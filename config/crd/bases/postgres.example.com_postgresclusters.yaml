@@ -108,6 +108,10 @@ spec:
                     type: integer
                   parameters:
                     additionalProperties:
+                      description: |-
+                        PostgresParameterValue bounds input at admission, before the immutable
+                        Postgres configuration can be persisted.
+                      maxLength: 1024
                       type: string
                     description: Parameters are supplied as individual postgres arguments,
                       never shell code.

@@ -46,7 +46,7 @@ func TestProtectedSettingsAndReplicationAreRejected(t *testing.T) {
 	for _, key := range []string{"archive_command", "shared_preload_libraries", "data_directory", "synchronous_standby_names", "listen_addresses"} {
 		t.Run(key, func(t *testing.T) {
 			c := cluster()
-			c.Spec.Postgres.Parameters = map[string]string{key: "unsafe"}
+			c.Spec.Postgres.Parameters = map[string]pgv1.PostgresParameterValue{key: "unsafe"}
 			if Validate(c) == nil {
 				t.Fatal("protected setting was accepted")
 			}
@@ -62,7 +62,7 @@ func TestProtectedSettingsAndReplicationAreRejected(t *testing.T) {
 func TestParameterValuesCannotBecomeShellCommands(t *testing.T) {
 	c := cluster()
 	injection := "$(touch /tmp/escaped); echo unsafe"
-	c.Spec.Postgres.Parameters = map[string]string{"log_statement": injection}
+	c.Spec.Postgres.Parameters = map[string]pgv1.PostgresParameterValue{"log_statement": pgv1.PostgresParameterValue(injection)}
 	pod := Pod(c)
 	args := pod.Spec.Containers[0].Args
 	if strings.Contains(args[0], injection) {

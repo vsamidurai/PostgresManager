@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 
 	pgv1 "github.com/vsamidurai/PostgresManager/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +22,8 @@ const (
 	ClusterLabel    = "postgres.example.com/cluster"
 	ClusterUIDLabel = "postgres.example.com/cluster-uid"
 	InstanceLabel   = "postgres.example.com/instance"
+	ManagedByLabel  = "app.kubernetes.io/managed-by"
+	ManagedByValue  = "postgres-manager"
 )
 
 var allowedParameters = map[string]bool{
@@ -39,7 +42,7 @@ func ResourceNames(c *pgv1.PostgresCluster) Names {
 }
 
 func Labels(c *pgv1.PostgresCluster) map[string]string {
-	return map[string]string{ClusterLabel: c.Name, ClusterUIDLabel: string(c.UID), InstanceLabel: ResourceNames(c).Instance, "app.kubernetes.io/managed-by": "postgres-manager"}
+	return map[string]string{ClusterLabel: c.Name, ClusterUIDLabel: string(c.UID), InstanceLabel: ResourceNames(c).Instance, ManagedByLabel: ManagedByValue}
 }
 
 func ContractHash(c *pgv1.PostgresCluster) string {
@@ -77,8 +80,8 @@ func Validate(c *pgv1.PostgresCluster) error {
 		if !allowedParameters[key] {
 			return fmt.Errorf("unsupported or protected Postgres parameter %q", key)
 		}
-		if len(value) > 1024 {
-			return fmt.Errorf("Postgres parameter %q exceeds 1024 bytes", key)
+		if utf8.RuneCountInString(string(value)) > 1024 {
+			return fmt.Errorf("Postgres parameter %q exceeds 1024 characters", key)
 		}
 	}
 	return nil
@@ -135,7 +138,7 @@ func Pod(c *pgv1.PostgresCluster) *corev1.Pod {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		args = append(args, "-c", key+"="+c.Spec.Postgres.Parameters[key])
+		args = append(args, "-c", key+"="+string(c.Spec.Postgres.Parameters[key]))
 	}
 	initArgs := "--auth-host=scram-sha-256"
 	if c.Spec.Bootstrap.InitDB.Checksums == nil || *c.Spec.Bootstrap.InitDB.Checksums {
