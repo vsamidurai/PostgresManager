@@ -42,8 +42,13 @@ type PostgresSpec struct {
 	// Parameters are supplied as individual postgres arguments, never shell code.
 	// +kubebuilder:validation:MaxProperties=8
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['max_connections', 'shared_buffers', 'work_mem', 'maintenance_work_mem', 'effective_cache_size', 'log_min_duration_statement', 'log_statement', 'log_connections'])",message="unsupported or protected Postgres parameter"
-	Parameters map[string]string `json:"parameters,omitempty"`
+	Parameters map[string]PostgresParameterValue `json:"parameters,omitempty"`
 }
+
+// PostgresParameterValue bounds input at admission, before the immutable
+// Postgres configuration can be persisted.
+// +kubebuilder:validation:MaxLength=1024
+type PostgresParameterValue string
 
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="bootstrap is immutable"
 type BootstrapSpec struct {

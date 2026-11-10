@@ -8,11 +8,8 @@ rules:
   - ""
   resources:
   - configmaps
-  - pods
-  - services
   verbs:
   - create
-  - delete
   - get
   - list
   - patch
@@ -29,12 +26,23 @@ rules:
   - ""
   resources:
   - persistentvolumeclaims
+  - services
   verbs:
   - create
   - get
   - list
   - patch
-  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -49,10 +57,7 @@ rules:
   verbs:
   - create
   - get
-  - list
-  - patch
   - update
-  - watch
 - apiGroups:
   - postgres.example.com
   resources:
@@ -61,7 +66,6 @@ rules:
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - postgres.example.com
@@ -76,7 +80,6 @@ rules:
   verbs:
   - get
   - patch
-  - update
 - apiGroups:
   - storage.k8s.io
   resources:

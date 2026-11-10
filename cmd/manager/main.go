@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -30,16 +29,18 @@ func main() {
 	scheme := runtime.NewScheme()
 	must(clientgoscheme.AddToScheme(scheme))
 	must(pgv1.AddToScheme(scheme))
-	options := ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: metricsAddress}, HealthProbeBindAddress: probeAddress, LeaderElection: leaderElection, LeaderElectionID: "postgres-manager-regional.postgres.example.com", LeaderElectionNamespace: electionNamespace}
-	if namespace != "" {
-		options.Cache = cache.Options{DefaultNamespaces: map[string]cache.Config{namespace: {}}}
+	options := ctrl.Options{
+		Scheme: scheme, Cache: controller.CacheOptions(namespace),
+		Metrics: metricsserver.Options{BindAddress: metricsAddress}, HealthProbeBindAddress: probeAddress,
+		LeaderElection: leaderElection, LeaderElectionID: "postgres-manager-regional.postgres.example.com",
+		LeaderElectionNamespace: electionNamespace,
 	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
 	must(err)
 	r := &controller.PostgresClusterReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme}
 	must(r.SetupWithManager(mgr))
 	must(mgr.AddHealthzCheck("healthz", healthz.Ping))
-	must(mgr.AddReadyzCheck("readyz", healthz.Ping))
+	must(mgr.AddReadyzCheck("cache", controller.CacheReady(mgr.GetCache())))
 	must(mgr.Start(ctrl.SetupSignalHandler()))
 }
 
