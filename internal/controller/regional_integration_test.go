@@ -223,7 +223,7 @@ func TestHAPromotionRequiresVerifiedFenceAndReplay(t *testing.T) {
 
 func TestHAOperationsRetainCompletionUntilAcknowledged(t *testing.T) {
 	f := newHAFixture(t)
-	cm, s := f.haState(t)
+	_, s := f.haState(t)
 	op := &pgv1.PostgresOperation{ObjectMeta: metav1.ObjectMeta{Name: "rejoin", Namespace: f.c.Namespace}, Spec: pgv1.PostgresOperationSpec{ClusterName: f.c.Name, ClusterUID: string(f.c.UID), Type: "Rejoin", TargetInstance: s.SyncMember}}
 	must(t, testClient.Create(t.Context(), op))
 	r := &PostgresOperationReconciler{f.r}
@@ -231,7 +231,7 @@ func TestHAOperationsRetainCompletionUntilAcknowledged(t *testing.T) {
 	_, err := r.Reconcile(t.Context(), req)
 	must(t, err)
 	f.reconcile(t)
-	cm, s = f.haState(t)
+	cm, s := f.haState(t)
 	o := f.observeHA(t, s, string(cm.UID), s.SyncMember, ha.Standby)
 	o.Operation = string(op.UID)
 	f.writeHAObservation(t, o)

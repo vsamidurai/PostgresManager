@@ -41,5 +41,3 @@ type PostgresOperationList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []PostgresOperation `json:"items"`
 }
-
-func init() { SchemeBuilder.Register(&PostgresOperation{}, &PostgresOperationList{}) }

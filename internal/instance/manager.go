@@ -181,7 +181,7 @@ func (a *Manager) Run(ctx context.Context) error {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		if !a.ready.Load() {
-			http.Error(w, "not ready", 503)
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)

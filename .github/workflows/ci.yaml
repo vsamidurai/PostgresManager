@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Stay on the supported Go minor while taking its current security patches.
+  GO_VERSION: '1.26.x'
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  verify:
+    name: Verify and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+      - name: Check source, modules, generated files, workflows and manifests
+        run: make verify
+      - name: Build operator and instance manager
+        run: make build
+
+  unit:
+    name: Unit tests
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+      - name: Run unit tests with race detection and coverage
+        run: |
+          mkdir -p bin/test-results
+          make test-unit 2>&1 | tee bin/test-results/unit.log
+      - name: Save unit test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-results
+          path: bin/test-results/
+          retention-days: 14
+
+  integration:
+    name: Kubernetes API tests
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+      - name: Run envtest with race detection and coverage
+        run: |
+          mkdir -p bin/test-results
+          make test-integration 2>&1 | tee bin/test-results/integration.log
+      - name: Save integration test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-results
+          path: bin/test-results/
+          retention-days: 14
+
+  security:
+    name: Go vulnerability check
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+      - name: Check reachable vulnerabilities
+        run: |
+          mkdir -p bin/test-results
+          make security 2>&1 | tee bin/test-results/security.log
+      - name: Save vulnerability report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: security-results
+          path: bin/test-results/security.log
+          retention-days: 14
+
+  e2e:
+    name: Kind (${{ matrix.suite }})
+    needs: [verify, unit, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: single-instance
+            target: test-e2e
+          - suite: regional-ha
+            target: test-e2e-ha
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+      - name: Build images and exercise PostgreSQL in Kind
+        env:
+          E2E_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p bin/test-results
+          make "$E2E_TARGET" 2>&1 | tee bin/test-results/e2e.log
+      - name: Save live test results and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kind-${{ matrix.suite }}-results
+          path: bin/test-results/e2e.log
+          retention-days: 14
+
+  required:
+    # Require this stable check in main's branch protection or ruleset.
+    name: CI required
+    if: always()
+    needs: [verify, unit, integration, security, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed, cancelled or skipped dependencies
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$JOB_RESULTS"

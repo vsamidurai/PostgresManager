@@ -166,5 +166,3 @@ type PostgresClusterList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []PostgresCluster `json:"items"`
 }
-
-func init() { SchemeBuilder.Register(&PostgresCluster{}, &PostgresClusterList{}) }

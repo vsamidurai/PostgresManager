@@ -390,13 +390,13 @@ func (r *PostgresClusterReconciler) reconcileService(ctx context.Context, c *pgv
 		return err
 	}
 	if !metav1.IsControlledBy(current, c) {
-		return fmt.Errorf("Service %s belongs to another owner", current.Name)
+		return fmt.Errorf("service %s belongs to another owner", current.Name)
 	}
 	if err := r.ensureWatchLabels(ctx, c, current); err != nil {
 		return err
 	}
 	if (current.Spec.ClusterIP == corev1.ClusterIPNone) != headless || current.Spec.Type != corev1.ServiceTypeClusterIP || len(current.Spec.ExternalIPs) != 0 {
-		return fmt.Errorf("Service %s has unsupported networking configuration", current.Name)
+		return fmt.Errorf("service %s has unsupported networking configuration", current.Name)
 	}
 	if reflect.DeepEqual(current.Spec.Selector, wanted.Spec.Selector) && reflect.DeepEqual(current.Spec.Ports, wanted.Spec.Ports) && !current.Spec.PublishNotReadyAddresses {
 		return nil
