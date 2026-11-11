@@ -140,7 +140,7 @@ func (r *PostgresClusterReconciler) haMember(ctx context.Context, c *pgv1.Postgr
 	err = r.reader().Get(ctx, key(m.Name), pod)
 	if apierrors.IsNotFound(err) {
 		if m.PodRequested {
-			return fmt.Errorf("Pod %s is missing; fencing evidence is required before repair", m.Name)
+			return fmt.Errorf("pod %s is missing; fencing evidence is required before repair", m.Name)
 		}
 		m.PodRequested = true
 		if err := r.saveHA(ctx, cm, *s); err != nil {
@@ -162,7 +162,7 @@ func (r *PostgresClusterReconciler) haMember(ctx context.Context, c *pgv1.Postgr
 		return err
 	}
 	if !metav1.IsControlledBy(pod, c) || (m.PodUID == "" && pod.Labels[postgres.InstanceLabel] != m.Name) || !m.PodRequested || (m.PodUID != "" && m.PodUID != string(pod.UID)) {
-		return fmt.Errorf("Pod identity changed for %s", m.Name)
+		return fmt.Errorf("pod identity changed for %s", m.Name)
 	}
 	if err := r.haLabels(ctx, c, pod, m.Name); err != nil {
 		return err

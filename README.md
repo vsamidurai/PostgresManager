@@ -35,6 +35,8 @@ make build
 make test
 make test-e2e
 make test-e2e-ha
+make verify
+make security
 ```
 
 `make test` runs vet, race-enabled unit tests, and integration tests against a real Kubernetes API server and etcd using envtest. It covers admission, idempotency, resource identity, missing resources, capacity changes, retention, rejected and ambiguous API writes, concurrent reconciles, Service readiness drift, and watch-driven reconciliation of 21 clusters. It also verifies cache filtering, namespace scope, readiness transitions, and finalization through a running manager. Envtest does not run database containers or a CSI driver.
@@ -51,6 +53,28 @@ make test-e2e-ha
 `make test-e2e-ha` creates a separate four-node Kind cluster. It exercises TLS streaming, database scale-up, primary crash and promotion, retained-data rejoin, switchover, fenced Pod replacement, paused-node refusal, API-loss shutdown, controller restart and fenced deletion. Both scripts remove their clusters and never use the caller's current context. These tests do not certify cloud infrastructure fencing, multi-region failover or a CSI driver.
 
 Hosts already running several clusters can exhaust their inotify instance limit before another Kind node starts. See [Kind's troubleshooting guidance](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files) if node startup reports `Too many open files`.
+
+### CI checks
+
+[The CI workflow](.github/workflows/ci.yaml) runs on pushes, pull requests, merge-queue entries and manual dispatch. It uses the current patch of Go 1.26, read-only repository permissions, commit-pinned GitHub Actions and cancellation of superseded runs.
+
+| Check | What it verifies |
+| --- | --- |
+| Verify and build | Go formatting, module tidiness/checksums, generated deepcopy/CRD/RBAC drift, vet, Staticcheck including integration tests, workflow and shell syntax, Kustomize rendering, and both binaries. |
+| Unit tests | Race-enabled unit tests and a coverage profile. |
+| Kubernetes API tests | Race-enabled envtest tests with controller/resource/protocol coverage. |
+| Go vulnerability check | Reachable Go vulnerabilities reported by `govulncheck`; this does not scan operating-system packages in container images. |
+| Kind (single-instance) | Builds the operator image and exercises bootstrap, leader changes, crash recovery and retention. |
+| Kind (regional-ha) | Builds both images and exercises replication, fencing, failover, partitions and rejoin. |
+| CI required | Passes only when every preceding check succeeds; skipped or cancelled dependencies do not pass. |
+
+After this workflow is merged, require **`CI required`** in the protection rule or ruleset for `main`. Adding the workflow alone does not enable branch protection. No path filters suppress this check, and `merge_group` supports a future merge queue.
+
+Run `make verify` and `make security` locally with a current Go 1.26 patch and `kubectl` installed. These checks install version-pinned analysis tools under `bin/tools/`; Kustomize rendering does not contact a cluster. `make verify-fmt` reports unformatted files; `make fmt` fixes them. Generated-file verification regenerates outputs and compares them with the Git index (the checked-out commit in CI), also rejecting unexpected untracked outputs. After intentional API changes, run `make manifests`, stage the API and generated files together, then verify before committing.
+
+Unit and integration coverage profiles are written separately under `bin/test-results/`. CI retains coverage and test logs for 14 days, including the end-to-end scripts' failure diagnostics. Shell pipelines preserve test failures when collecting logs. Coverage is reported without an arbitrary percentage gate.
+
+[Dependabot](.github/dependabot.yaml) proposes weekly updates for GitHub Actions, Go dependencies and Docker base images. Related Kubernetes modules are grouped. PostgreSQL major image updates are excluded because they require an explicit upgrade design; updates are never automatically merged.
 
 ## Run against a development cluster
 

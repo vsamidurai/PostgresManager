@@ -6,6 +6,13 @@ CONTROLLER_TOOLS_VERSION := v0.23.0
 ENVTEST_VERSION := v0.25.2
 ENVTEST_K8S_VERSION ?= 1.37.0
 IMG ?= postgres-manager:dev
+TEST_OUTPUT ?= $(LOCALBIN)/test-results
+STATICCHECK_VERSION := v0.8.2
+ACTIONLINT_VERSION := v1.7.12
+GOVULNCHECK_VERSION := v1.9.0
+STATICCHECK := $(LOCALBIN)/tools/staticcheck/$(STATICCHECK_VERSION)/staticcheck
+ACTIONLINT := $(LOCALBIN)/tools/actionlint/$(ACTIONLINT_VERSION)/actionlint
+GOVULNCHECK := $(LOCALBIN)/tools/govulncheck/$(GOVULNCHECK_VERSION)/govulncheck
 
 .PHONY: generate manifests fmt vet build test test-unit test-integration run install deploy docker-build test-e2e
 
@@ -28,10 +35,54 @@ build: generate fmt vet
 test: manifests fmt vet test-unit test-integration
 
 test-unit:
-	go test -race -count=1 ./...
+	mkdir -p $(TEST_OUTPUT)
+	go test -race -count=1 -covermode=atomic -coverprofile=$(TEST_OUTPUT)/unit.coverage.out ./...
 
 test-integration: manifests $(ENVTEST)
-	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)" go test -race -count=1 -tags=integration -v ./internal/controller
+	mkdir -p $(TEST_OUTPUT)
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/envtest -p path)" go test -race -count=1 -tags=integration -covermode=atomic -coverpkg=./internal/controller,./internal/postgres,./internal/ha -coverprofile=$(TEST_OUTPUT)/integration.coverage.out -v ./internal/controller
+
+.PHONY: verify verify-fmt verify-modules verify-generated verify-manifests lint lint-workflows security
+verify: verify-fmt verify-modules verify-generated vet lint lint-workflows verify-manifests
+
+# Verification fails on drift; unlike fmt, it never silently fixes Go source.
+verify-fmt:
+	@set -eu; files=$$(gofmt -l api cmd internal); if [ -n "$$files" ]; then printf 'Run make fmt for:\n%s\n' "$$files"; exit 1; fi
+
+verify-modules:
+	go mod tidy -diff
+	go mod verify
+
+verify-generated: manifests
+	git diff --exit-code -- api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml
+	@set -eu; files=$$(git ls-files --others --exclude-standard -- api/v1alpha1/zz_generated.deepcopy.go config/crd/bases config/rbac/role.yaml); if [ -n "$$files" ]; then printf 'Commit generated files:\n%s\n' "$$files"; exit 1; fi
+
+verify-manifests:
+	@mkdir -p $(TEST_OUTPUT)
+	kubectl kustomize config/default > $(TEST_OUTPUT)/install.yaml
+
+lint: $(STATICCHECK)
+	$(STATICCHECK) ./...
+	$(STATICCHECK) -tags=integration ./internal/controller
+
+lint-workflows: $(ACTIONLINT)
+	$(ACTIONLINT)
+	@set -e; for script in hack/*.sh; do bash -n "$$script"; done
+
+security: $(GOVULNCHECK)
+	$(GOVULNCHECK) ./...
+
+$(STATICCHECK):
+	mkdir -p $(@D)
+	GOBIN=$(@D) go install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION)
+
+$(ACTIONLINT):
+	mkdir -p $(@D)
+	GOBIN=$(@D) go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+
+$(GOVULNCHECK):
+	mkdir -p $(@D)
+	GOBIN=$(@D) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 
 run: manifests
 	go run ./cmd/manager --leader-elect=false

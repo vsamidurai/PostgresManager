@@ -96,7 +96,7 @@ func Validate(c *pgv1.PostgresCluster) error {
 			return fmt.Errorf("unsupported or protected Postgres parameter %q", key)
 		}
 		if utf8.RuneCountInString(string(value)) > 1024 {
-			return fmt.Errorf("Postgres parameter %q exceeds 1024 characters", key)
+			return fmt.Errorf("postgres parameter %q exceeds 1024 characters", key)
 		}
 	}
 	return nil
