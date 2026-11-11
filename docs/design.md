@@ -8,7 +8,7 @@ Date: 2026-11-03
 
 Build one operator product that owns PostgreSQL lifecycle management in each Kubernetes cluster and coordinates database topologies across regions. Regional and global controllers share a codebase, image, API conventions, and release process. PostgreSQL replication and application connections run directly between database endpoints; the controllers do not proxy either traffic stream.
 
-This design fixes the responsibility boundaries and safety requirements. The Postgres instance manager remains an implementation decision governed by the [Postgres management contract](postgres.md#postgres-management-contract). No dependency on another PostgreSQL operator is proposed.
+This design fixes the responsibility boundaries and safety requirements. The regional implementation now uses the native Go instance manager; its current [protocol and limits](regional-ha.md) implement a subset of the [Postgres management contract](postgres.md#postgres-management-contract). No dependency on another PostgreSQL operator is proposed.
 
 ## Requirements and decisions
 

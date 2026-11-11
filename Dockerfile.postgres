@@ -1,0 +1,13 @@
+FROM golang:1.26 AS builder
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY api/ api/
+COPY internal/ internal/
+COPY cmd/ cmd/
+RUN CGO_ENABLED=0 go build -trimpath -o /instance ./cmd/instance
+
+FROM postgres:17-bookworm
+COPY --from=builder /instance /usr/local/bin/postgres-manager-instance
+USER 999:999
+ENTRYPOINT ["/usr/local/bin/postgres-manager-instance"]

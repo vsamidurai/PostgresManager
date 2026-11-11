@@ -2,7 +2,7 @@
 
 Status: Open decision with required behavior defined
 
-The initial single-instance implementation uses the official PostgreSQL image entrypoint with a bootstrap identity/version guard. It does not implement the HA contract below or settle the instance-manager decision. See [current implementation scope](../README.md#implemented-scope).
+The single-instance profile uses the official PostgreSQL entrypoint with a bootstrap identity/version guard. Regional HA now uses the native Go instance manager; see its [implemented protocol and limits](regional-ha.md). The comparison below records the alternatives considered, while the full global contract remains a target design.
 
 The operator owns regional and global Kubernetes reconciliation. The **Postgres component** contains PostgreSQL and its **instance manager** inside each database pod. The instance manager supervises PostgreSQL, applies configuration, exposes health, and executes a safe local HA protocol.
 
@@ -42,7 +42,7 @@ Only the Postgres instance manager starts PostgreSQL. A pod recreation checks cu
 
 ## Native instance manager requirements
 
-If selected, the native manager runs as the parent process of PostgreSQL. Regional controllers coordinate candidate selection; the instance manager enforces process authority and performs the actual transition. A controller lease is not itself a database write lease.
+The selected native manager runs as the parent process of PostgreSQL. Regional controllers coordinate candidate selection; the instance manager enforces process authority and performs the actual transition. A controller lease is not itself a database write lease.
 
 The local protocol must define renewal deadlines, monotonic timing, restart behavior, process pause behavior, network partitions, and node reboot. Expiry causes the instance manager to stop writable PostgreSQL, but safe promotion still requires proof that a stalled previous writer cannot resume. The proof may be confirmed shutdown with durable inhibition or an effective infrastructure fence.
 
@@ -73,4 +73,4 @@ Use the same two- or three-Kubernetes-cluster test harness and client commit led
 
 Reject a candidate that permits two writers, drops a policy-covered acknowledged transaction, silently weakens durability, or cannot distinguish uncertain command outcomes. Then compare implementation size, operational dependencies, recovery clarity, upgrade compatibility, and measured control-plane cost.
 
-Select the Postgres instance manager implementation before implementing production automatic failover. API scaffolding, providers, observation, backups, and manually exercised prototype workflows can proceed while this decision is open. The native instance manager is a credible design option, but its safety properties must be established by the protocol review and tests rather than inferred from sharing the operator's codebase.
+The regional implementation selects the native instance manager. Production automatic failover still requires protocol review and deployment-profile certification; sharing the operator's codebase does not establish its safety properties. Unreachable-writer infrastructure fencing and the global authority contract remain unimplemented.

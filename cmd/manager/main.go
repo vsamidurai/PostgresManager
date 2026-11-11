@@ -39,6 +39,7 @@ func main() {
 	must(err)
 	r := &controller.PostgresClusterReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme}
 	must(r.SetupWithManager(mgr))
+	must((&controller.PostgresOperationReconciler{PostgresClusterReconciler: r}).SetupWithManager(mgr))
 	must(mgr.AddHealthzCheck("healthz", healthz.Ping))
 	must(mgr.AddReadyzCheck("cache", controller.CacheReady(mgr.GetCache())))
 	must(mgr.Start(ctrl.SetupSignalHandler()))

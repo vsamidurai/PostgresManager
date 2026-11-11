@@ -5,7 +5,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// PostgresClusterSpec is deliberately limited to a single bootstrap-only server.
+// PostgresClusterSpec describes a regional PostgreSQL cluster.
+// +kubebuilder:validation:XValidation:rule="has(self.replication) || self.instances == 1",message="multiple instances require the managed replication profile"
+// +kubebuilder:validation:XValidation:rule="has(self.replication) == has(oldSelf.replication)",message="replication must be selected when creating the cluster"
+// +kubebuilder:validation:XValidation:rule="!has(self.replication) || self.replication.mode != 'Synchronous' || self.instances >= 2",message="synchronous replication requires at least two instances"
+// +kubebuilder:validation:XValidation:rule="!has(self.replication) || self.instances >= 2",message="managed HA requires at least two instances"
 type PostgresClusterSpec struct {
 	// Region is descriptive in this regional implementation.
 	// +kubebuilder:validation:MinLength=1
@@ -14,11 +18,15 @@ type PostgresClusterSpec struct {
 	Region string `json:"region"`
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
-	Instances int32         `json:"instances,omitempty"`
-	Postgres  PostgresSpec  `json:"postgres"`
-	Bootstrap BootstrapSpec `json:"bootstrap"`
-	Storage   StorageSpec   `json:"storage"`
+	// +kubebuilder:validation:Maximum=5
+	// +kubebuilder:validation:XValidation:rule="self >= oldSelf",message="scale-down requires a future membership-removal operation"
+	Instances int32 `json:"instances,omitempty"`
+	// Replication selects the native instance manager at cluster creation.
+	// +optional
+	Replication *RegionalReplicationSpec `json:"replication,omitempty"`
+	Postgres    PostgresSpec             `json:"postgres"`
+	Bootstrap   BootstrapSpec            `json:"bootstrap"`
+	Storage     StorageSpec              `json:"storage"`
 	// Resources are fixed at bootstrap until controlled replacement is implemented.
 	// +kubebuilder:default={}
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="resource changes require a future replacement operation"
@@ -28,13 +36,31 @@ type PostgresClusterSpec struct {
 	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 }
 
+// RegionalReplicationSpec is immutable: durability changes require a separate
+// membership protocol. Exactly one named standby acknowledges synchronous commits.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="replication policy and credentials are immutable"
+type RegionalReplicationSpec struct {
+	// +kubebuilder:default=Synchronous
+	// +kubebuilder:validation:Enum=Synchronous;Asynchronous
+	Mode string `json:"mode,omitempty"`
+	// CredentialsSecretRef contains the replication role's password key.
+	CredentialsSecretRef SecretReference `json:"credentialsSecretRef"`
+	// TLSSecretRef contains tls.crt, tls.key and ca.crt. The server certificate
+	// must cover the instance DNS names under the cluster's headless Service.
+	TLSSecretRef SecretReference `json:"tlsSecretRef"`
+	// +kubebuilder:default=Lossless
+	// +kubebuilder:validation:Enum=Lossless;AllowPotentialDataLoss
+	DataLossPolicy string `json:"dataLossPolicy,omitempty"`
+}
+
 // PostgresSpec describes the supported PostgreSQL 17 Debian image contract.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Postgres configuration is immutable until update operations are implemented"
 type PostgresSpec struct {
 	// +kubebuilder:default=17
 	// +kubebuilder:validation:Enum=17
 	MajorVersion int32 `json:"majorVersion,omitempty"`
-	// Image must implement the official postgres:17-bookworm entrypoint and UID 999.
+	// Image uses PostgreSQL 17 Debian and UID 999. Replication additionally
+	// requires the native postgres-manager-instance binary (Dockerfile.postgres).
 	// +kubebuilder:default="postgres:17-bookworm"
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=512
@@ -89,18 +115,35 @@ type DataStorageSpec struct {
 }
 
 type PostgresClusterStatus struct {
-	ObservedGeneration int64  `json:"observedGeneration,omitempty"`
-	InstanceID         string `json:"instanceID,omitempty"`
-	PodName            string `json:"podName,omitempty"`
-	PodUID             string `json:"podUID,omitempty"`
-	PVCName            string `json:"pvcName,omitempty"`
-	PVCUID             string `json:"pvcUID,omitempty"`
-	ReadyInstances     int32  `json:"readyInstances,omitempty"`
-	Endpoint           string `json:"endpoint,omitempty"`
-	VolumeCapacity     string `json:"volumeCapacity,omitempty"`
+	PrimaryInstance string `json:"primaryInstance,omitempty"`
+	AuthorityTerm   int64  `json:"authorityTerm,omitempty"`
+	HAPhase         string `json:"haPhase,omitempty"`
+	// +listType=map
+	// +listMapKey=name
+	Instances          []PostgresInstanceStatus `json:"instances,omitempty"`
+	ObservedGeneration int64                    `json:"observedGeneration,omitempty"`
+	InstanceID         string                   `json:"instanceID,omitempty"`
+	PodName            string                   `json:"podName,omitempty"`
+	PodUID             string                   `json:"podUID,omitempty"`
+	PVCName            string                   `json:"pvcName,omitempty"`
+	PVCUID             string                   `json:"pvcUID,omitempty"`
+	ReadyInstances     int32                    `json:"readyInstances,omitempty"`
+	Endpoint           string                   `json:"endpoint,omitempty"`
+	VolumeCapacity     string                   `json:"volumeCapacity,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type PostgresInstanceStatus struct {
+	Name             string `json:"name"`
+	PodUID           string `json:"podUID,omitempty"`
+	PVCUID           string `json:"pvcUID,omitempty"`
+	Role             string `json:"role,omitempty"`
+	SystemIdentifier string `json:"systemIdentifier,omitempty"`
+	Timeline         int64  `json:"timeline,omitempty"`
+	ReplayLSN        string `json:"replayLSN,omitempty"`
+	Message          string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
