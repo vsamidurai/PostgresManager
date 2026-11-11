@@ -51,6 +51,14 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
+  - get
+  - patch
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
@@ -77,7 +85,25 @@ rules:
   - postgres.example.com
   resources:
   - postgresclusters/status
+  - postgresoperations/status
   verbs:
+  - get
+  - patch
+- apiGroups:
+  - postgres.example.com
+  resources:
+  - postgresoperations
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
+  verbs:
+  - create
   - get
   - patch
 - apiGroups:

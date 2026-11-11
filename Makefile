@@ -23,6 +23,7 @@ vet:
 
 build: generate fmt vet
 	go build -o bin/manager ./cmd/manager
+	go build -o bin/postgres-manager-instance ./cmd/instance
 
 test: manifests fmt vet test-unit test-integration
 
@@ -46,6 +47,13 @@ docker-build:
 
 test-e2e: manifests
 	bash hack/e2e.sh
+
+.PHONY: test-e2e-ha postgres-image
+test-e2e-ha: manifests
+	bash hack/e2e-ha.sh
+
+postgres-image:
+	docker build -f Dockerfile.postgres -t postgres-manager-postgres:dev .
 
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)

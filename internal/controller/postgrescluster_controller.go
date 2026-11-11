@@ -88,7 +88,13 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !c.DeletionTimestamp.IsZero() {
+		if c.Spec.Replication != nil {
+			return r.reconcileHA(ctx, c)
+		}
 		return r.deleteCluster(ctx, c)
+	}
+	if c.Spec.Replication != nil {
+		return r.reconcileHA(ctx, c)
 	}
 	if err := postgres.Validate(c); err != nil {
 		return r.report(ctx, c, nil, nil, "InvalidSpec", err.Error(), true)

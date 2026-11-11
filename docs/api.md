@@ -4,7 +4,7 @@ Status: Draft schema and examples
 
 API group: `postgres.example.com/v1alpha1` pending selection of a domain controlled by the project
 
-The examples below specify the broader proposed API. An initial single-instance `PostgresCluster` CRD and regional controller now exist; see the [implemented API types](../api/v1alpha1/postgrescluster_types.go), [deployable sample](../config/samples/postgrescluster.yaml), and [implementation limits](../README.md#implemented-scope). Registry digests, cluster identities, bucket names, and Secret references below are placeholders. Defaults and enums below describe the target design unless included in that implemented subset.
+The examples below specify the broader proposed API. Regional single-instance and native HA profiles now exist, with a small `PostgresOperation` API for switchover and rejoin. See the [implemented API types](../api/v1alpha1/postgrescluster_types.go), [HA deployment and operations](regional-ha.md), and [implementation limits](../README.md#implemented-scope). Registry digests, cluster identities, bucket names, and Secret references below are placeholders. Defaults and enums below describe the target design unless included in that implemented subset.
 
 ## Public resources
 

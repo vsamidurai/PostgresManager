@@ -36,8 +36,12 @@ var allowedParameters = map[string]bool{
 type Names struct{ Instance, PVC, Control, Writer, Headless string }
 
 func ResourceNames(c *pgv1.PostgresCluster) Names {
+	return InstanceNames(c, 1)
+}
+
+func InstanceNames(c *pgv1.PostgresCluster, ordinal int) Names {
 	sum := sha256.Sum256([]byte(c.UID))
-	id := c.Name + "-" + hex.EncodeToString(sum[:5]) + "-1"
+	id := c.Name + "-" + hex.EncodeToString(sum[:5]) + "-" + strconv.Itoa(ordinal)
 	return Names{Instance: id, PVC: id + "-data", Control: id + "-control", Writer: c.Name + "-rw", Headless: c.Name + "-instances"}
 }
 
@@ -48,6 +52,9 @@ func Labels(c *pgv1.PostgresCluster) map[string]string {
 func ContractHash(c *pgv1.PostgresCluster) string {
 	spec := c.Spec.DeepCopy()
 	spec.Storage.Data.Size = "" // Capacity is the only mutable field in this slice.
+	if spec.Replication != nil {
+		spec.Instances = 0
+	} // HA membership is journaled separately.
 	b, _ := json.Marshal(spec)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -57,8 +64,16 @@ func Validate(c *pgv1.PostgresCluster) error {
 	if c.UID == "" || len(c.Name) > 40 {
 		return fmt.Errorf("cluster must have a UID and a name of at most 40 characters")
 	}
-	if c.Spec.Instances != 1 {
-		return fmt.Errorf("only one instance is supported; replication is not implemented")
+	if c.Spec.Replication == nil && c.Spec.Instances != 1 {
+		return fmt.Errorf("multiple instances require the managed replication profile")
+	}
+	if p := c.Spec.Replication; p != nil {
+		if c.Spec.Bootstrap.InitDB.Checksums != nil && !*c.Spec.Bootstrap.InitDB.Checksums {
+			return fmt.Errorf("managed replication requires data checksums")
+		}
+		if c.Spec.Instances < 2 || c.Spec.Instances > 5 || (p.Mode != "Synchronous" && p.Mode != "Asynchronous") || (p.DataLossPolicy != "Lossless" && p.DataLossPolicy != "AllowPotentialDataLoss") || p.CredentialsSecretRef.Name == "" || p.TLSSecretRef.Name == "" {
+			return fmt.Errorf("invalid managed replication profile")
+		}
 	}
 	if c.Spec.Postgres.MajorVersion != 17 || c.Spec.Postgres.Image == "" {
 		return fmt.Errorf("a PostgreSQL 17 image is required")

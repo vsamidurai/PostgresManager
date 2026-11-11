@@ -18,3 +18,13 @@ jobs:
       - run: make build
       - run: git diff --exit-code -- api config/crd config/rbac/role.yaml
       - run: make test-e2e
+  regional-ha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make test-e2e-ha
